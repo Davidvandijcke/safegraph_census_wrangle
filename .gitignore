@@ -1,0 +1,3 @@
+# ignore csv and .csv.gz
+*.csv
+*.csv.gz

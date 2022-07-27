@@ -1,0 +1,26 @@
+{
+    "id": "4ACD9456",
+    "path": "~/Dropbox (University of Michigan)/github/census_wrangle/20_1_censusWrangle.R",
+    "project_path": "20_1_censusWrangle.R",
+    "type": "r_source",
+    "hash": "833228165",
+    "contents": "",
+    "dirty": false,
+    "created": 1658946243156.0,
+    "source_on_save": false,
+    "relative_order": 3,
+    "properties": {
+        "source_window_id": "",
+        "Source": "Source",
+        "cursorPosition": "180,0",
+        "scrollLine": "151"
+    },
+    "folds": "",
+    "lastKnownWriteTime": 1658946944,
+    "encoding": "UTF-8",
+    "collab_server": "",
+    "source_window": "",
+    "last_content_update": 1658946944585,
+    "read_only": false,
+    "read_only_alternatives": []
+}

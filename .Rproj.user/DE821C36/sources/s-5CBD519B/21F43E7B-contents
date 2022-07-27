@@ -1,0 +1,641 @@
+#*************************************************************************************************
+
+# 11_processData.R
+# CALCULATE DEVICE SURGE MEASURES AND PREPARE MASTER FILES
+
+#*************************************************************************************************
+
+
+#********************************************************************************************
+# CALCULATE DEVICE SURGE MEASURE AND PREPARE LONG DATA
+#********************************************************************************************
+
+cat("
+************************************************************************************
+Calculate device surge measure and prepare long data
+************************************************************************************
+")
+
+geo_adj <- fread(file.path(dataBy, 'geo_adj_stacked.csv.gz'))
+
+
+# keep only visits to DC
+geo_adj[, destination_cbg :=  padCbg(destination_cbg)]
+geo_adj[, destination_state := substr(destination_cbg,1,2)]
+geo_adj <- geo_adj[destination_state == '11']
+
+
+
+geo_adj[, ds := fastDate(ds)]
+
+
+
+
+#### CALCULATE DEVICE SURGE MEASURES ####
+
+## construct total device visits per destination cbg
+geo_adj[, num_devices_adj_total := sum(num_devices_adj, na.rm = TRUE), by = c("destination_cbg", "ds")]
+
+
+# average in week before insurrection
+reference_start <- as.Date("2020-12-28")  # start of reference period
+reference_end <- as.Date("2021-01-03")  # end of reference period
+
+protest_dates <- c("2020-10-03", "2020-11-03", "2020-11-14", "2020-12-12")
+avg <- geo_adj[(ds >= reference_start) & (ds <= reference_end) & # get average for pre-protest period
+                 !ds %in% protest_dates] # 3 October: Unsilent Majority March
+avg <- unique(avg, by = c("destination_cbg","ds"))
+avg <- avg[, .(avg =  mean(num_devices_adj_total, na.rm = TRUE)), by = "destination_cbg"] # calculate average number of devices on non-protest days
+
+geo_adj <- avg[geo_adj, on = "destination_cbg"]
+
+
+geo_adj[, surge_perc :=  100 * num_devices_adj_total / avg]
+geo_adj[, surge_level :=   num_devices_adj_total - avg]
+
+
+
+# merge in city names
+zips <- fread(file.path(dataIn, 'geo', "tractToCity.csv"))
+zips$city <- gsub("St.", "Saint", zips$city)
+
+zips$TRACTFIPS <- str_pad(zips$TRACTFIPS, 11, "left", "0")
+
+geo_adj[,state := NULL] # ugly small caps, replace with zips var
+geo_adj <- zips[geo_adj, on = "TRACTFIPS"]
+
+
+## set "network panel" structure
+setcolorder(geo_adj, c("origin_cbg", "destination_cbg", "ds"))
+
+
+#### WRITE LONG DATASET TO FILE ####
+fwrite(geo_adj, file.path(dataBy, "geo_stacked_long.csv.gz"))
+
+
+
+
+
+
+
+
+#********************************************************************************************
+# CONSTRUCT PANEL FOR DEMEANING
+#********************************************************************************************
+
+cat("
+**********************************************************************************************
+Construct Panel for Demeaning
+**********************************************************************************************
+")
+
+### PANEL ####
+
+## Read Data
+geo_out <- fread(file.path(dataBy, 'geo_stacked_long.csv.gz'))
+
+geo_out[, ds := fastDate(ds)] # alter some variables
+geo_out[, destination_cbg := padCbg(destination_cbg)]
+geo_out[, origin_cbg := padCbg(origin_cbg)]
+
+# keep only traffic to Capitol CBG
+geo_out <- geo_out[destination_cbg == "110010062021"] 
+
+
+
+## Set Panel Structure and Write to File
+
+# reorder columns
+setcolorder(geo_out, c("origin_cbg", "destination_cbg", "ds"))
+
+# keep only unique origin CBGs: if we see origin CBG going to two protest CBGs on a day, keep only max visitor count
+geo_out <- geo_out[!is.na(num_devices_adj)]
+geo_out <- unique(geo_out, by = c("origin_cbg", "ds"))
+
+
+# balance panel
+idvar <- unique(geo_out$origin_cbg)
+tvar <- unique(geo_out$ds)
+idvar <- idvar[!is.na(idvar)]
+tvar <- tvar[!is.na(tvar)]
+length(idvar) * length(tvar)
+
+# aggregate and merge with balanced panel
+temp <- data.table(expand.grid(origin_cbg = idvar, ds = sort(tvar)))
+vars_changing <- c("num_devices", "num_devices_adj", 
+                   "num_devices_adj_total", "number_devices_residing") # vars that change over time
+vars_constant <- setdiff(colnames(geo_out), c("ds", vars_changing)) # vars that are constant over time
+
+temp <- unique(geo_out[, ..vars_constant], by = "origin_cbg")[temp, on = c("origin_cbg")] # join in the time-constant variables (the unique() is just to make the merge lighter)
+geo_out <- geo_out[,c("origin_cbg", "ds", ..vars_changing)][temp, on = c("origin_cbg", "ds")] # merge observations into empty balanced sample s.t. missing company-time combos are empty
+geo_out[,(vars_changing) := lapply(.SD, nafill, fill = 0), .SDcols = vars_changing] # fill missing dates with zero
+
+geo_out[, origin_county := substr(origin_cbg,1,5)] # create some variables
+geo_out[, origin_state := substr(origin_cbg,1,2)]
+rm(temp)
+
+# drop missings and unnecessary columns
+vars_drop <- c( "destination_state", "date_range_start","avg", 
+                "surge_perc", "surge_level", "num_devices_weighted")
+geo_out[, (vars_drop) := NULL]
+
+fwrite(geo_out, file.path(dataBy, paste0('panel_regression_withNAs.csv.gz')))
+rm(geo_out)
+
+
+
+
+
+
+
+#********************************************************************************************
+#### FULL CROSS-SECTION ####
+#********************************************************************************************
+
+cat("
+**********************************************************************************************
+Get full cross-section for Jan 6, 2021; merge in external data; write to master dataset
+**********************************************************************************************
+")
+
+
+
+# load data Jan 6 full crossection
+geo_cross <- fread((file.path(dataIn, 'safegraph_geos', '2021', '01', '20210106_cbg_graph_full.txt')), drop = 'V1')
+
+geo_cross[,ds := fastDate("2021-01-06")]
+
+colnames(geo_cross) <- c('origin_cbg', 'destination_cbg', 'num_devices', 'ds')
+
+geo_cross[, origin_cbg := padCbg(origin_cbg)]
+geo_cross[, destination_cbg := padCbg(destination_cbg)]
+
+
+# find which origin cbgs appeared in destination cbgs around Capitol
+geo_cross[, nearCapitol := as.numeric(destination_cbg %in% c('110010059001', '110010105002', '110010102001'))]
+geo_cross[, nearCapitol := max(nearCapitol), by = "origin_cbg"]
+
+
+
+
+
+#### Census and Home Panel ####
+
+pop <- data.table::copy(SafeGraphR::cbg_pop) # note that data table only copies when you change the table
+home_panel <- fread(file.path(dataIn, 'safegraph_home_panel/2021/01/13/19/home_panel_summary.csv'),
+                    colClasses = c("date_range_start" = "character",
+                                   "date_range_end" = "character",
+                                   "state" = "character",
+                                   "census_block_group" = "character",
+                                   "number_devices_residing" = "integer"))
+
+setnames(pop, "poi_cbg", "origin_cbg") # rename for merging
+setnames(home_panel, "census_block_group", "origin_cbg")
+
+pop[,origin_cbg := padCbg(origin_cbg)] # pad cbg fips
+home_panel[,origin_cbg := padCbg(origin_cbg)]
+
+home_panel[,date_range_start := fastDate(substr(date_range_start,1,10))] # fix home panel dates
+home_panel[,date_range_end := NULL]
+
+geo_cross[,date_range_start := fastDate(cut(ds, "week"))] # get first day of week for merging
+
+# merge
+geo_cross <- pop[geo_cross, on = 'origin_cbg'] # merge cbg population data into graph
+geo_cross <- home_panel[geo_cross, on = c("origin_cbg", "date_range_start")]
+
+# compute adjusted visitor count
+geo_cross[, num_devices_total := sum(number_devices_residing, na.rm = TRUE), by = c("ds")] # get total number of devices by date
+geo_cross[, pop_total := sum(unweighted_pop, na.rm = TRUE), by = c("ds")] # get total number of population by date
+geo_cross[, num_devices_weighted := num_devices_total / num_devices * unweighted_pop / pop_total] # sampling weight adjustment
+geo_cross[, c("num_devices_total", "pop_total") := NULL]
+geo_cross[, num_devices_adj := num_devices * unweighted_pop / number_devices_residing] # post-stratification adjustment
+
+g(pop, home_panel) %=% NULL
+
+
+
+
+##### Visitors to Capitol ####
+
+vars_outcome <- c("num_devices_adj", "num_devices")
+for (var in vars_outcome) {
+  newvar <- paste0(var, "_capitol")
+  geo_cross[, (newvar) := 0]
+  geo_cross[destination_cbg == "110010062021", (newvar) := .SD, .SDcols = var]  # select only Capitol CBG
+  geo_cross[, (var) := NULL]
+  setnames(geo_cross, newvar, var)
+}
+
+# COLLAPSE by origin_cbg and check if unique
+geo_cross <- geo_cross[, lapply(.SD, sum), by = c("origin_cbg", "number_devices_residing", "nearCapitol"), .SDcols = vars_outcome]
+assert(dim(unique(geo_cross, by = "origin_cbg")) == dim(geo_cross))
+
+
+# construct some variables
+geo_cross[, origin_county := substr(origin_cbg,1,5)]
+geo_cross[, origin_state := substr(origin_cbg,1,2)]
+
+
+
+
+#### Census Information ####
+
+source("20_1_censusWrangle.R")
+setnames(census, "census_block_group", "origin_cbg")
+
+# merge into main data table
+census[, origin_cbg := padCbg(origin_cbg)]
+geo_cross <- census[geo_cross, on = "origin_cbg"]
+rm(census)
+
+
+
+#### CBG-Level Vote Share: 2016 ####
+
+redo_votes_cbg <- FALSE # redo intersection of precinct-level results and cbg shapefiles? (!! takes a long time)
+
+if (redo_votes_cbg) { 
+  source("12_precincts_to_cbgs.R")
+}
+
+
+## Neighbors' vote share
+
+redo_polygons <- FALSE
+
+if (redo_polygons) { # redo calculation of CBG adjacency matrix? (WARNING: memory and time intensive)
+  
+  # read cbg shapefile as sp object
+  cbg_stacked <- read_sf(file.path(dataIn, 'census_bg_shapefiles', 'census_bg_merged.shp')) %>% 
+    st_transform(2163) %>% # transform coordinate system
+    set_names(colnames(.) %>% str_to_lower()) # set column names to lower caps
+  
+  # calculate adjacencies
+  adjnb <- spdep::poly2nb(cbg_stacked)
+  
+  # convert adjacencies to 0-1 coded (style = B) list of lists, with empty lists allowed (zero.policy = TRUE: there are a couple cbgs w no neighbors, not sure which)
+  listw <- spdep::nb2listw(adjnb, style = "B", zero.policy = TRUE)
+  
+  save(listw, file =  file.path(dataBy, 'adjbn.listw.Rdata')) # save to Rdata object because saving it as anything else kills the RAM
+  
+} 
+
+
+redo_neighbors <- FALSE # recalculate neighbors' vote share?
+
+if (redo_neighbors) {
+  trumpIsland() # calculate neighbors' vote share in 2016 and save to file (default parameters are for 2016)
+} 
+
+votes_cbg <- fread(file.path(dataBy, 'votes2016_byCbg_neighbors.csv.gz'))
+votes_cbg[, origin_cbg := padCbg(origin_cbg)]
+
+geo_cross <- votes_cbg[geo_cross, on = "origin_cbg"]
+rm(votes_cbg)
+
+
+
+
+#### County-level vote share: 2016 ####
+
+votes_county <- fread(file.path(dataIn, 'election', "countypres_2000-2016.csv"), select = c("FIPS", "candidate", "candidatevotes", "totalvotes", "year"))
+votes_county[, origin_county := str_pad(FIPS, 5, 'left', '0')]
+votes_county[, FIPS := NULL]
+votes_county <- votes_county[year == 2016]
+votes_county[, year := NULL]
+
+votes_trump <- votes_county[candidate == "Donald Trump"]
+votes_trump[, trump_share_county := candidatevotes / totalvotes]
+setnames(votes_trump, "candidatevotes", "votes_trump")
+
+votes_clinton <- votes_county[candidate == "Hillary Clinton"]
+votes_clinton[, clinton_share_county := candidatevotes / totalvotes]
+setnames(votes_clinton, "candidatevotes", "votes_clinton_county")
+
+
+votes_twoparty <- votes_county[candidate == "Hillary Clinton" | candidate == "Donald Trump"]
+votes_twoparty[, twoparty_votes := sum(candidatevotes), by = c("origin_county")]
+votes_twoparty <- votes_county[candidate == "Hillary Clinton"]
+votes_twoparty[, clinton_share_votes_county := candidatevotes / totalvotes]
+votes_twoparty[, candidatevotes := NULL]
+
+
+geo_cross <- cbind(votes_clinton, votes_trump, votes_twoparty)[geo_cross, on = "origin_county"]
+rm(votes_clinton, votes_trump, votes_county, votes_twoparty)
+
+
+
+
+#### CBG-Level Vote Share: 2020 ####
+
+redo_votes_cbg <- FALSE # redo intersection of precinct-level results and cbg shapefiles? (!! takes a long time)
+
+if (redo_votes_cbg) { 
+  source("12_1_precincts_to_cbgs_2020.R")
+}
+
+
+## Origin CBG and Neighbors' vote share
+
+redo_neighbors <- FALSE # recalculate neighbors' vote share?
+
+if (redo_neighbors) {
+  trumpIsland(fileName = file.path(dataIn, 'election', '2020', 'precinct_cbgs_all_2020.csv.gz'), 
+              trumpName = "votes_rep", clintonName = "votes_dem", totalName = "votes_total", 
+              cbgName = "geoid") # calculate neighbors' vote share in 2016 and save to file (default parameters are for 2016)
+  
+}
+votes_cbg <- fread(file.path(dataBy, 'precinct_cbgs_all_2020_neighbors.csv.gz'))
+votes_cbg[, origin_cbg := padCbg(origin_cbg)]
+
+vars_rename <- c("trump_neighbor_avg", "trump_neighbor", "totalvotes_cbg", "votes_dem", "votes_rep") # make clear it's 2020
+vars_new <- paste0(vars_rename, "_2020")
+setnames(votes_cbg, vars_rename, vars_new)
+
+setnames(votes_cbg, "clinton_share_votes_2020", "biden_share_votes_2020", skip_absent = TRUE)
+
+geo_cross <- votes_cbg[,c(..vars_new, "trump_share_votes_2020", "biden_share_votes_2020", "origin_cbg")][geo_cross, on = "origin_cbg"]
+rm(votes_cbg)
+
+
+
+
+
+#### County- and state-level vote share: 2020 ####
+
+votes_county <- fread(file.path(dataIn, 'election', "countypres_2000-2020.csv"), select = c("county_fips", "candidate", "candidatevotes", "totalvotes", "year"))
+setnames(votes_county, "county_fips", "FIPS")
+votes_county[, origin_county := str_pad(FIPS, 5, 'left', '0')]
+votes_county[, FIPS := NULL]
+votes_county <- votes_county[year == 2020]
+votes_county[, year := NULL]
+votes_county <- votes_county[, list(totalvotes = mean(totalvotes), candidatevotes = sum(candidatevotes)), 
+                             by = c("origin_county", "candidate")]
+votes_county[, state := substr(origin_county,1,2)]
+
+votes_trump <- votes_county[candidate == "DONALD J TRUMP"]
+votes_trump[, trump_share_county_2020 := candidatevotes / totalvotes]
+votes_trump[, trump_share_state_2020 := sum(candidatevotes) / sum(totalvotes), by = "state"]
+setnames(votes_trump, c("candidatevotes", "totalvotes"), c("votes_trump_county_2020", "totalvotes_county_2020"))
+
+votes_biden <- votes_county[candidate == "JOSEPH R BIDEN JR"]
+votes_biden[, biden_share_county_2020 := candidatevotes / totalvotes]
+votes_biden[, biden_share_state_2020 := sum(candidatevotes) / sum(totalvotes), by = "state"]
+setnames(votes_biden, "candidatevotes", "votes_biden_county_2020")
+votes_biden$totalvotes <- NULL
+
+
+votes_twoparty <- votes_county[candidate == "JOSEPH R BIDEN JR" | candidate == "DONALD J TRUMP"]
+votes_twoparty[, twoparty_votes_2020 := sum(candidatevotes), by = c("origin_county")]
+votes_twoparty <- votes_county[candidate == "JOSEPH R BIDEN JR"]
+votes_twoparty[, biden_share_votes_county_2020 := candidatevotes / totalvotes]
+votes_twoparty[, trump_share_votes_county_2020 := 1 - biden_share_votes_county_2020]
+votes_twoparty[, biden_share_votes_state_2020 := sum(candidatevotes) / sum(totalvotes), by = "state"]
+votes_twoparty[, trump_share_votes_state_2020 := 1 - biden_share_votes_state_2020, by = "state"]
+votes_twoparty[, candidatevotes := NULL]
+votes_twoparty$totalvotes <- NULL
+
+df_merge <- cbind(votes_biden, votes_trump, votes_twoparty)
+df_merge[, state := NULL]
+geo_cross <- df_merge[geo_cross, on = "origin_county"]
+rm(votes_biden, votes_trump, votes_county, votes_twoparty)
+
+
+
+#### Parler Data ####
+
+redo_intersection_parler <- FALSE
+# get parler-cbg match
+if (redo_intersection_parler) {
+  source("20_3_parlerWrangle.R")
+} 
+
+parler <- fread(file.path(dataIn, 'parler', 'parler-videos-geocoded-cbg.csv.gz'), select = c("ds", "cbg"))
+parler[,origin_cbg := padCbg(cbg)]
+parler[, ds := fastDate(ds)]
+
+# keep only parler posts after election and not on big protest days
+parler <- parler[ds >= as.Date("2016-11-03") & ds != as.Date("2020-11-14") & ds != as.Date("2021-01-06")]
+parler <- parler[, .(parler_count = .N), by = "origin_cbg"] # count posts per BG
+
+geo_cross <- parler[geo_cross, on = "origin_cbg"]
+
+geo_cross[is.na(parler_count) | parler_count == Inf, parler_count := 0] # set missings and inf to zero
+rm(parler)
+
+
+#### Hate Groups Data ####
+
+redo_hate <- FALSE
+
+if (redo_hate) { # redo distance calculation for hate groups
+  source("20_2_hateGroupsDistance.R")
+} 
+
+hate_distance <- fread(file.path(dataBy, 'hate_distance.csv'))
+hate_distance[, origin_cbg := padCbg(origin_cbg)]
+hate_names <- setdiff(colnames(hate_distance), "origin_cbg")
+
+geo_cross <- hate_distance[geo_cross, on = "origin_cbg"]
+
+rm(hate_distance)
+
+
+
+
+#### Add In Number of Protests / Riots (ACLED) #### 
+
+protests <- fread(file.path(dataBy, 'protestsRiots_intersected.csv.gz'))
+
+protests <- protests[EVENT_DATE < as.Date("2021-01-06")]
+
+protests[, origin_cbg := padCbg(id)]
+protests <- protests[, origin_county := substr(id,1,5)]
+
+riots <- protests[EVENT_TYPE == "Riots"]
+protests <- protests[EVENT_TYPE == "Protests"]
+
+# count number of riots by cbg and county and join
+riots <- riots[, num_riots_county := .N,  by = 'origin_county']
+riots <- riots[, num_riots_cbg := .N,  by = 'origin_cbg']
+riots <- unique(riots, by = "origin_cbg")
+riots <- riots[,c("num_riots_county", "num_riots_cbg", "origin_cbg")]
+geo_cross <- riots[geo_cross, on = "origin_cbg"]
+
+# count number of protests by cbg and county and join
+protests <- protests[, num_protests_county := .N,  by = 'origin_county']
+protests <- protests[, num_protests_cbg := .N,  by = 'origin_cbg']
+protests <- unique(protests, by = "origin_cbg")
+protests <- protests[,c("num_protests_county", "num_protests_cbg", "origin_cbg")]
+geo_cross <- protests[geo_cross, on = "origin_cbg"]
+
+# fill missings with zero
+vars_fill <- c("num_protests_county", "num_riots_county", "num_protests_cbg", "num_riots_cbg")
+geo_cross[,(vars_fill) := lapply(.SD, nafill, fill = 0), .SDcols = vars_fill] # fill missing dates with zero
+
+
+
+
+
+#### Average to Capitol in 3 Months Before ####
+
+geo_avg <- fread(file.path(dataBy, 'panel_regression_withNAs.csv.gz'))
+geo_avg[, origin_cbg := padCbg(origin_cbg)]
+geo_avg[, device_share_origin := num_devices_adj / pop]
+geo_avg[, device_share_dest := num_devices_adj / num_devices_adj_total]
+
+vars_avg <- c("num_devices_adj", "device_share_origin", "device_share_dest")
+vars_select <- c(vars_avg, "origin_cbg", "ds")
+geo_avg <- geo_avg[, ..vars_select]
+
+for (i in 1:3) {   # calculate average number of visitors from these cbgs in [i] months prior, conditional and unconditional
+  
+  start_date <- seq(as.Date("2020-10-01"), length = i, by = "months")[i]
+  m <- paste0(i, "m")
+  
+  dates <- seq.Date(as.Date(start_date), as.Date("2021-01-03"), by = "day")
+  dates <- setdiff(dates, as.Date(c("2020-10-03", "2020-11-03", "2020-11-14", "2020-12-12"))) # earlier protest dates in DC / holidays
+  
+  temp <- geo_avg[as.Date(ds) %in% dates,
+                  unlist(lapply(.SD, function(x) { list( avg = sum(x, na.rm = TRUE)) }), recursive = FALSE),
+                  by = "origin_cbg", .SDcols = vars_avg]
+  colnames(temp)[grepl(".avg", colnames(temp))] <- gsub(".avg", paste0(".avg", m), colnames(temp)[grepl(".avg", colnames(temp))] )
+  
+  
+  vars_avg_new <- paste0(vars_avg,".avg", i, "m")
+  vars_avg_new_cond <- paste0(vars_avg,".avgcond", i, "m")
+  
+  geo_avg <- temp[geo_avg, on = "origin_cbg"]
+  geo_avg[, countNotZero := sum(as.numeric(num_devices_adj > 0)), by = "origin_cbg"]
+  geo_avg[, (vars_avg_new_cond) := lapply(.SD, function(x) x / countNotZero), .SDcols = vars_avg_new] # conditional average
+  geo_avg[, (vars_avg_new) := lapply(.SD, function(x) x / length(dates)), .SDcols = vars_avg_new] # unconditional average
+  
+}
+
+geo_avg <- unique(geo_avg, by = "origin_cbg")[, !c("ds", ..vars_avg)]
+
+geo_cross <- geo_avg[geo_cross, on = "origin_cbg"]
+
+# fill missings with zero
+vars_fill <- colnames(geo_cross)[grepl(".avg", colnames(geo_cross))]
+geo_cross[, (vars_fill) := lapply(.SD, nafill, fill = 0), .SDcols = vars_fill ] # fill in zeros
+rm(geo_avg)
+
+
+
+
+
+
+#### Add In Lat Longs ####
+cbg_geo <- fread(file.path(dataIn, 'safegraph_open_census', 'metadata', 'cbg_geographic_data.csv'),
+                 select = c("census_block_group", "latitude", "longitude"))
+
+names(cbg_geo) <- c("origin_cbg", "origin_lat", "origin_long")
+cbg_geo[, origin_cbg := padCbg(origin_cbg)]
+
+geo_cross <- cbg_geo[geo_cross, on = "origin_cbg"]
+
+
+
+
+#### Add In Congressional Districts #### 
+
+cd <- fread(file.path(dataIn, 'geo', 'geocorr2018.csv'))
+
+cd[, tract := gsub("\\.", "", tract)]
+cd[, origin_cbg := paste0(county, tract, bg)]
+
+cd[, cd116 := paste0(state, cd116)]
+
+cd <- cd[, c('origin_cbg', 'cd116')]
+
+geo_cross <- cd[geo_cross, on = "origin_cbg"]
+
+
+
+
+#### Covid cases and deaths ####
+
+
+covid <- fread(file.path(dataIn, 'covid', 'us-counties.csv'))
+
+covid[, origin_county := str_pad(fips, 5, 'left', '0')]
+covid[, ds := fastDate(date)]
+
+covid <- covid[ds == as.Date("2021-01-06")] # keep ony cum. cases and deaths on jan 6
+
+covid <- covid[, c("cases", "deaths", "origin_county")]
+
+geo_cross <- covid[geo_cross, on = "origin_county"]
+
+
+
+
+#### Election night shift #### 
+
+shift <- fread(file.path(dataIn, 'election', 'nyt_counties.csv')) 
+shift[, fips := str_pad(fips, 5, 'left', '0')]
+
+tz <- data.table::copy(countytimezones::county_tzs %>% setDT())
+tz[, fips := str_pad(fips, 5, 'left', '0')]
+tz <- tz[,c("fips", "tz")]
+
+shift <- tz[shift, on = "fips"]
+
+shift <- shift[!is.na(tz)] # keep only county fips, there are also electoral districts etc in there
+
+shift[, time := as.POSIXct(time, tz = "UCT")]
+
+local_time <- countytimezones::calc_local_time(shift$time, fips = shift$fips) # calculcate local time zones
+
+shift <- cbind(shift, local_time)
+
+shift[, local_time_uct := as.POSIXct(local_time, tz = "UCT")] # lets pretend the local time is UCT 
+
+uct_ref <- as.numeric(as.POSIXct("2020-11-04 00:00:00", tz = "UCT")) # get midnight of election night in numeric 
+shift[, since_midnight := as.numeric(local_time_uct) - uct_ref]
+shift <- shift[!since_midnight < 0] # we dont care about times before midnight
+shift[, close_to_midnight := min(since_midnight, na.rm = TRUE), by = c("fips")] # get proximity to midnight of vote update closest to midnight for each county
+shift <- shift[since_midnight == close_to_midnight] # keep only that one
+
+
+# get final outcome
+outcome <- fread(file.path(dataIn, 'election', '2020_US_County_Level_Presidential_Results.csv')) # source: https://github.com/tonmcg/US_County_Level_Election_Results_08-20/blob/master/2020_US_County_Level_Presidential_Results.csv
+
+outcome[,repLead_final := 100*(per_gop - per_dem)]
+outcome[, fips := str_pad(county_fips, 5, 'left', '0')]
+outcome <- outcome[, c("fips", "repLead_final", "per_gop")]
+
+# calculate shift from midnight to final outcome
+shift[, repLead := leader_margin_value] # same but for temporary Trump lead
+shift[leader_party_id == "democrat", repLead := -repLead]
+
+# calculate percentage at midnight
+shift[,  per_gop_midnight := trumpd / votes]
+
+shift <- outcome[shift, on = "fips"]
+
+shift[, repSwing_pp := repLead_final - repLead] # get swing in favor of / against Trump from midnight to end
+shift[, repSwing_share := per_gop - per_gop_midnight] # get swing in favor of / against Trump from midnight to end
+
+shift <- shift[,c("fips", "repSwing_pp", "repSwing_share", "repLead", "per_gop_midnight")]
+setnames(shift, "fips", "origin_county")
+
+shift <- unique(shift, by = "origin_county") # there's some identical duplicates, probably comes from raw data
+
+geo_cross <- shift[geo_cross, on = "origin_county"]
+
+
+
+#### Write to file ####
+
+# print some rows
+dim(geo_cross)
+head(geo_cross)
+summary(geo_cross)
+assert(dim(geo_cross)[1] %between% c(200000, 225000)) # make sure approximately the right number of observations
+
+
+fwrite(geo_cross, file.path(dataOut, 'cross_regression.csv'))
+rm(geo_cross)
